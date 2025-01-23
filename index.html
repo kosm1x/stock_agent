@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Stock Market Network</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            background-color: #000000; 
+            color: white;
+            margin: 0;
+            padding: 20px;
+        }
+        #chart { 
+            width: 100%; 
+            height: 800px;
+            border: 1px solid #333;
+            border-radius: 8px;
+        }
+        .node text { 
+            fill: #fff;
+            font-size: 12px;
+            pointer-events: none;
+        }
+        .link { 
+            stroke: #444;
+            stroke-opacity: 0.6;
+        }
+        .last-updated { 
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            color: #666;
+        }
+        h1 {
+            text-align: center;
+            color: #fff;
+            margin-bottom: 20px;
+        }
+        .sector-node { stroke: #0066cc; }
+        .industry-node { stroke: #9933cc; }
+        .stock-node { stroke: #cc3366; }
+        .tooltip {
+            position: absolute;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.9);
+            border: 1px solid #3182ce;
+            border-radius: 6px;
+            pointer-events: none;
+            font-size: 14px;
+            color: #ffffff;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            min-width: 200px;
+            line-height: 1.6;
+        }
+        .tooltip strong {
+            color: #3182ce;
+            font-size: 16px;
+            display: block;
+            margin-bottom: 8px;
+            border-bottom: 1px solid #2d3748;
+            padding-bottom: 4px;
+        }
+        .tooltip .label {
+            color: #a0aec0;
+            display: inline-block;
+            width: 70px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Stock Market Network</h1>
+    <div id="chart"></div>
+    <div class="last-updated" id="last-updated"></div>
+    <div class="tooltip"></div>
+    <script>
+        async function fetchData() {
+            const response = await fetch('http://localhost:5003/api/stocks');
+            return await response.json();
+        }
+
+        function createGraph(data) {
+            // Clear previous SVG if any
+            d3.select('#chart').selectAll('*').remove();
+
+            const width = document.getElementById('chart').clientWidth;
+            const height = document.getElementById('chart').clientHeight;
+
+            const svg = d3.select('#chart').append('svg')
+                .attr('width', width)
+                .attr('height', height)
+                .style('background-color', '#000000');
+
+            // Add zoom behavior
+            const g = svg.append('g');
+            const zoom = d3.zoom()
+                .scaleExtent([0.1, 4])
+                .on('zoom', (event) => {
+                    g.attr('transform', event.transform);
+                });
+            svg.call(zoom);
+
+            // Color scales - vibrant blue to crimson
+            const colorScale = d3.scaleOrdinal()
+                .domain(['sector', 'industry', 'stock'])
+                .range(['#0066cc', '#9933cc', '#cc3366']);
+
+            // Enhanced force simulation
+            const simulation = d3.forceSimulation()
+                .force('link', d3.forceLink().id(d => d.id)
+                    .distance(d => {
+                        // Longer distances between sectors and industries
+                        if (d.source.group === 'sector' && d.target.group === 'industry') {
+                            return 150;
+                        }
+                        // Shorter distances between industries and stocks
+                        return 50;
+                    })
+                    .strength(d => {
+                        // Stronger connections between sectors and industries
+                        if (d.source.group === 'sector' && d.target.group === 'industry') {
+                            return 0.5;
+                        }
+                        // Weaker connections between industries and stocks
+                        return 0.2;
+                    }))
+                .force('charge', d3.forceManyBody()
+                    .strength(d => {
+                        // Stronger repulsion for sectors
+                        if (d.group === 'sector') return -1000;
+                        // Medium repulsion for industries
+                        if (d.group === 'industry') return -500;
+                        // Weaker repulsion for stocks
+                        return -200;
+                    }))
+                .force('center', d3.forceCenter(width / 2, height / 2))
+                .force('collision', d3.forceCollide().radius(d => d.value * 1.2))
+                .force('x', d3.forceX(width / 2).strength(0.1))
+                .force('y', d3.forceY(height / 2).strength(0.1));
+
+            // Create links
+            const link = g.append('g')
+                .selectAll('line')
+                .data(data.links)
+                .enter().append('line')
+                .attr('class', 'link')
+                .style("stroke", "#2d3748")
+                .style("stroke-width", d => d.value);
+
+            // Create node groups
+            const node = g.append('g')
+                .selectAll('g')
+                .data(data.nodes)
+                .enter().append('g')
+                .attr('class', d => `node ${d.group}-node`)
+                .call(d3.drag()
+                    .on('start', dragstarted)
+                    .on('drag', dragged)
+                    .on('end', dragended));
+
+            // Add circles to nodes
+            node.append('circle')
+                .attr('r', d => d.value)
+                .style("fill", d => colorScale(d.group))
+                .style("stroke", d => d.group === 'stock' ? '#cc3366' : '#2d3748')
+                .style("stroke-width", d => d.group === 'stock' ? 1 : 1.5)
+                .on('mouseover', showTooltip)
+                .on('mouseout', hideTooltip);
+
+            // Add labels to nodes
+            node.append('text')
+                .text(d => d.name)
+                .attr("x", d => d.value + 5)
+                .attr("y", 4)
+                .style("font-weight", d => d.group === "sector" ? "bold" : "normal");
+
+            // Update positions on each tick
+            simulation
+                .nodes(data.nodes)
+                .on('tick', () => {
+                    link
+                        .attr('x1', d => d.source.x)
+                        .attr('y1', d => d.source.y)
+                        .attr('x2', d => d.target.x)
+                        .attr('y2', d => d.target.y);
+
+                    node.attr('transform', d => `translate(${d.x},${d.y})`);
+                });
+
+            simulation.force('link')
+                .links(data.links);
+
+            // Drag functions
+            function dragstarted(event, d) {
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }
+
+            function dragged(event, d) {
+                d.fx = event.x;
+                d.fy = event.y;
+            }
+
+            function dragended(event, d) {
+                if (!event.active) simulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            }
+
+            // Tooltip functions
+            function showTooltip(event, d) {
+                if (d.group !== 'stock') return;
+                
+                const tooltipContent = `
+                    <strong>${d.name}</strong><br>
+                    <span class="label">Price:</span> ${d.price}<br>
+                    <span class="label">Volume:</span> ${d.volume}<br>
+                    <span class="label">AO:</span> ${d.ao}<br>
+                    <span class="label">AC:</span> ${d.ac}
+                `;
+                
+                d3.select('.tooltip')
+                    .html(tooltipContent)
+                    .style('left', (event.pageX + 10) + 'px')
+                    .style('top', (event.pageY - 10) + 'px')
+                    .transition()
+                    .duration(200)
+                    .style('opacity', .9);
+            }
+
+            function hideTooltip() {
+                d3.select('.tooltip')
+                    .transition()
+                    .duration(500)
+                    .style('opacity', 0);
+            }
+        }
+
+        async function updateLastUpdated() {
+            const response = await fetch('http://localhost:5003/api/last-updated');
+            const lastUpdated = await response.text();
+            document.getElementById('last-updated').innerText = `Last Updated: ${lastUpdated}`;
+        }
+
+        async function init() {
+            const data = await fetchData();
+            createGraph(data);
+            updateLastUpdated();
+        }
+
+        init();
+    </script>
+</body>
+</html>
