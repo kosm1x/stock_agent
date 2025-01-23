@@ -1,412 +1,305 @@
-import requests
-import pymongo
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 import random
 import time
 import traceback
+import os
+from db_manager import DatabaseManager
+from api_manager import APIManager
+import config
 
-# Set up logging
-logging.basicConfig(
-    filename='stock_agent.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-# MongoDB Atlas connection
-MONGO_URI = "mongodb+srv://fmoctezuma:7NqAJ5A37xbR2D0N@cluster0.29urq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+# Clear existing log file
 try:
-    mongo_client = pymongo.MongoClient(MONGO_URI)
-    db = mongo_client['stock_data']
-    logging.info("Successfully connected to MongoDB Atlas")
+    if os.path.exists('stock_agent.log'):
+        with open('stock_agent.log', 'w') as f:
+            pass  # Just truncate the file
 except Exception as e:
-    logging.error(f"Error connecting to MongoDB Atlas: {str(e)}")
-    raise
+    print(f"Warning: Could not clear log file: {e}")
 
-# Alpha Vantage API configuration
-API_KEY = 'CWIA9S112Q0BHF6N'
-MAX_REQUESTS_PER_MINUTE = 75
+# Set up logging with rotation
+log_handler = RotatingFileHandler(
+    'stock_agent.log',
+    maxBytes=100000,  # Approximately 1000 lines
+    backupCount=1     # Keep one backup file
+)
+log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
-def convert_to_datetime(date_str):
-    """Convert date string to datetime object"""
-    return datetime.strptime(date_str, '%Y-%m-%d')
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+# Remove any existing handlers
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+root_logger.addHandler(log_handler)
 
-def process_time_series(time_series):
-    """Convert time series data with string dates to proper format"""
-    processed_data = {}
-    for date_str, values in time_series.items():
-        # Convert string values to float
-        processed_values = {
-            'timestamp': convert_to_datetime(date_str).isoformat(),  # Store as ISODate
-            'open': float(values['1. open']),
-            'high': float(values['2. high']),
-            'low': float(values['3. low']),
-            'close': float(values['4. close']),
-            'volume': int(values['5. volume'])
-        }
-        processed_data[date_str] = processed_values  # Keep string as key
-    return processed_data
-
-def trim_log_file(max_lines=1000):
-    """Trim the log file to keep only the last N lines"""
-    try:
-        with open('stock_agent.log', 'r') as f:
-            lines = f.readlines()
-        
-        if len(lines) > max_lines:
-            with open('stock_agent.log', 'w') as f:
-                f.writelines(lines[-max_lines:])
-            logging.info(f"Trimmed log file to last {max_lines} lines")
-    except Exception as e:
-        logging.error(f"Error trimming log file: {str(e)}")
-
-def get_random_stocks(num_stocks=35):
-    """Get random stocks from Alpha Vantage listing"""
-    try:
-        url = f'https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={API_KEY}'
-        response = requests.get(url)
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch stock listing: {response.status_code}")
-        
-        # Split the CSV content into lines and skip header
-        lines = response.text.strip().split('\n')[1:]
-        logging.info(f"Total available stocks: {len(lines)}")
-        
-        stocks = []
-        for line in lines:
-            symbol, name, exchange, _, _, _, _ = line.split(',')
-            # Only include stocks from major exchanges
-            if exchange in ['NYSE', 'NASDAQ']:
-                stocks.append({'symbol': symbol, 'name': name})
-        
-        logging.info(f"Filtered stocks from major exchanges: {len(stocks)}")
-        selected_stocks = random.sample(stocks, min(num_stocks, len(stocks)))
-        logging.info(f"Selected {len(selected_stocks)} new random stocks")
-        return selected_stocks
+class StockAgent:
+    def __init__(self):
+        self.db_manager = DatabaseManager()
+        self.api_manager = APIManager()
+        self.db = self.db_manager.get_database()
     
-    except Exception as e:
-        logging.error(f"Error getting random stocks: {str(e)}")
-        raise
+    def convert_to_datetime(self, date_str):
+        """Convert date string to datetime object"""
+        return datetime.strptime(date_str, '%Y-%m-%d')
 
-def get_stock_info(symbol):
-    """Get company overview including sector, industry, and market cap"""
-    try:
-        url = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={symbol}&apikey={API_KEY}'
-        response = requests.get(url)
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch stock info: {response.status_code}")
-            
-        data = response.json()
-        if not data:
-            return None
-            
-        # Get market cap and convert to numeric value
-        market_cap_str = data.get('MarketCapitalization', '0')
-        market_cap = float(market_cap_str)
-        
-        # Check minimum market cap (2B = 2,000,000,000)
-        if market_cap < 2000000000:
-            logging.info(f"Skipping {symbol}: Market cap below 2B")
-            return None
-            
-        sector = data.get('Sector', '')
-        industry = data.get('Industry', '')
-        
-        # Skip if sector or industry is empty or unknown
-        if not sector or not industry or sector.upper() == 'UNKNOWN' or industry.upper() == 'UNKNOWN':
-            logging.info(f"Skipping {symbol}: Unknown sector or industry")
-            return None
-            
-        return {
-            'name': data.get('Name', symbol),
-            'sector': sector,
-            'industry': industry,
-            'market_cap': market_cap
-        }
-        
-    except Exception as e:
-        logging.error(f"Error getting stock info for {symbol}: {str(e)}")
-        return None
-
-def fetch_stock_data(symbol):
-    """Fetch weekly stock data from Alpha Vantage"""
-    try:
-        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_WEEKLY&symbol={symbol}&apikey={API_KEY}'
-        response = requests.get(url)
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch stock data: {response.status_code}")
-            
-        data = response.json()
-        if 'Weekly Time Series' not in data:
-            logging.error(f"No weekly time series data for {symbol}")
-            return {}
-            
-        time_series = data['Weekly Time Series']
+    def process_time_series(self, time_series):
+        """Convert time series data with string dates to proper format"""
         processed_data = {}
-        
-        # Process only the last 52 weeks (1 year) of data
-        for date, values in list(time_series.items())[:52]:
-            processed_data[date] = {
-                'timestamp': convert_to_datetime(date).isoformat(),
+        for date_str, values in time_series.items():
+            processed_values = {
+                'timestamp': self.convert_to_datetime(date_str).isoformat(),
                 'open': float(values['1. open']),
                 'high': float(values['2. high']),
                 'low': float(values['3. low']),
                 'close': float(values['4. close']),
                 'volume': int(values['5. volume'])
             }
-            
+            processed_data[date_str] = processed_values
         return processed_data
-    except Exception as e:
-        logging.error(f"Error fetching stock data: {str(e)}")
-        return {}
 
-def calculate_ao_ac(data):
-    """Calculate Awesome Oscillator (AO) and Acceleration/Deceleration (AC) using weekly data"""
-    try:
-        # Sort dates in ascending order
-        sorted_dates = sorted(data.keys(), key=lambda x: datetime.fromisoformat(data[x]['timestamp']))
-        if len(sorted_dates) < 34:
-            logging.warning(f"Not enough data points for AO/AC calculation. Only have {len(sorted_dates)} weeks, need 34.")
-            return 0, 0
-
-        # Calculate median prices for each week
-        prices = []
-        for date in sorted_dates:
-            values = data[date]
-            high = float(values['high'])
-            low = float(values['low'])
-            median = (high + low) / 2
-            prices.append(median)
-
-        # Calculate AO (5-week SMA - 34-week SMA)
-        sma5 = sum(prices[-5:]) / 5
-        sma34 = sum(prices[-34:]) / 34
-        ao = round(sma5 - sma34, 4)
-
-        # For AC, we need 5 periods of AO values
-        if len(prices) < 39:
-            logging.warning(f"Not enough data points for AC calculation. Only have {len(sorted_dates)} weeks, need 39.")
-            return ao, 0
-
-        # Calculate AO for each of the last 5 periods
-        ao_values = []
-        for i in range(5):
-            idx = -(5 - i)  # Start from -5 to -1
-            period_prices = prices[:(idx or None)]  # Use all prices up to this point
-            if len(period_prices) >= 34:
-                sma5_period = sum(period_prices[-5:]) / 5
-                sma34_period = sum(period_prices[-34:]) / 34
-                ao_period = sma5_period - sma34_period
-                ao_values.append(ao_period)
-            else:
-                logging.warning(f"Not enough historical prices for period {i}")
-
-        if len(ao_values) == 5:
-            # AC is AO minus SMA5 of AO
-            ao_sma = sum(ao_values) / 5
-            ac = round(ao - ao_sma, 4)
-            logging.info(f"Calculated AC using AO values: {ao_values}, SMA5: {ao_sma}, Final AC: {ac}")
-        else:
-            ac = 0
-            logging.warning(f"Could not calculate AC: only got {len(ao_values)} AO values, need 5")
-
-        logging.info(f"Final indicators - AO: {ao}, AC: {ac}")
-        return ao, ac
-
-    except Exception as e:
-        logging.error(f"Error calculating AO/AC: {str(e)}")
-        traceback.print_exc()
-        return 0, 0
-
-def update_stock_data():
-    """Update stock data in MongoDB without replacing existing records"""
-    try:
-        # Get MongoDB connection
-        client = pymongo.MongoClient(MONGO_URI)
-        db = client['stock_data']
-        
-        processed_count = 0
-        max_attempts = 5  # Maximum number of attempts to get enough stocks
-        target_stocks = 35  # Number of stocks we want to process
-        wait_time = 15  # Increased wait time between API calls
-        
-        for attempt in range(max_attempts):
-            if processed_count >= target_stocks:
-                break
-                
-            # Get new random stocks
-            num_needed = target_stocks - processed_count
-            stocks = get_random_stocks(num_needed * 3)  # Get 3x the number needed to account for filtering
-            logging.info(f"Attempt {attempt + 1}: Attempting to process {len(stocks)} stocks, need {num_needed} more")
+    def get_random_stocks(self, num_stocks=35, is_initial=True):
+        """Get random stocks from Alpha Vantage"""
+        try:
+            # Get current watchlist
+            existing_stocks = set(doc['symbol'] for doc in self.db.watchlist.find())
             
-            # Process each stock
-            for stock in stocks:
-                if processed_count >= target_stocks:
-                    break
-                    
-                try:
-                    # Get stock info including sector and industry
-                    info = get_stock_info(stock['symbol'])
-                    if info is None:
-                        logging.info(f"Skipping {stock['symbol']}: Did not meet criteria")
-                        continue
-                    
-                    logging.info(f"Processing {stock['symbol']} - {info['sector']} - {info['industry']} - Market Cap: ${info['market_cap']:,.2f}")
-                    time.sleep(wait_time)  # Rate limiting for Alpha Vantage API
-                    
-                    # Get weekly time series data
-                    data = fetch_stock_data(stock['symbol'])
-                    
-                    # Prepare document
-                    stock_doc = {
-                        'symbol': stock['symbol'],
-                        'name': info['name'],
-                        'sector': info['sector'],
-                        'industry': info['industry'],
-                        'market_cap': info['market_cap'],
-                        'last_updated': datetime.now().isoformat(),
-                        'data': data
-                    }
-                    
-                    # Check if stock already exists
-                    existing_stock = db['stocks'].find_one({'symbol': stock['symbol']})
-                    if existing_stock:
-                        # Update existing stock
-                        db['stocks'].update_one(
-                            {'symbol': stock['symbol']}, 
-                            {'$set': stock_doc}
+            # Use smaller number for subsequent iterations
+            if not is_initial:
+                num_stocks = min(10, num_stocks)
+            
+            # Get listing of all US stocks
+            listing_data = self.api_manager.get_stock_data(symbol=None, function='LISTING_STATUS')
+            
+            # Filter out existing stocks and get new ones
+            new_stocks = [stock for stock in listing_data if stock['symbol'] not in existing_stocks]
+            
+            if new_stocks:
+                # Randomly shuffle stocks to avoid always checking the same ones
+                random.shuffle(new_stocks)
+                selected = []
+                
+                # Try stocks until we have enough that meet our criteria
+                for stock in new_stocks:
+                    if len(selected) >= num_stocks:
+                        break
+                        
+                    try:
+                        # Get company overview for market cap
+                        overview = self.api_manager.get_stock_data(
+                            symbol=stock['symbol'],
+                            function='OVERVIEW'
                         )
-                        logging.info(f"Updated existing stock: {stock['symbol']}")
-                    else:
-                        # Insert new stock
-                        db['stocks'].insert_one(stock_doc)
-                        logging.info(f"Inserted new stock: {stock['symbol']}")
-                    
-                    processed_count += 1
-                    time.sleep(wait_time)  # Rate limiting for Alpha Vantage API
-                    
-                except Exception as e:
-                    logging.error(f"Error processing {stock['symbol']}: {str(e)}")
-                    continue
+                        
+                        # Get current price
+                        quote = self.api_manager.get_stock_data(
+                            symbol=stock['symbol'],
+                            function='GLOBAL_QUOTE'
+                        )
+                        
+                        # Get weekly data to verify history
+                        weekly_data = self.api_manager.get_stock_data(
+                            symbol=stock['symbol'],
+                            function='TIME_SERIES_WEEKLY'
+                        )
+                        
+                        # Verify we have some weekly data
+                        time_series = weekly_data.get('Weekly Time Series', {})
+                        if not time_series:
+                            logging.info(f"Skipped {stock['symbol']} - No historical data available")
+                            continue
+                        
+                        market_cap = float(overview.get('MarketCapitalization', 0))
+                        price = float(quote.get('Global Quote', {}).get('05. price', 0))
+                        
+                        # Apply market cap and price constraints
+                        if market_cap > 2_000_000_000 and price < 100:  # >$2B cap and <$100 price
+                            selected.append(stock)
+                            dates = sorted(time_series.keys())
+                            oldest_date = dates[0] if dates else 'unknown'
+                            logging.info(f"Selected {stock['symbol']} - Market Cap: ${market_cap:,.2f}, Price: ${price:.2f}, Data since: {oldest_date}")
+                        else:
+                            logging.info(f"Skipped {stock['symbol']} - Market Cap: ${market_cap:,.2f}, Price: ${price:.2f}")
+                            
+                    except Exception as e:
+                        logging.warning(f"Error checking {stock['symbol']}: {str(e)}")
+                        continue
+                
+                # Add selected stocks to watchlist
+                for stock in selected:
+                    self.db.watchlist.update_one(
+                        {'symbol': stock['symbol']},
+                        {'$set': {
+                            'symbol': stock['symbol'],
+                            'name': stock['name'],
+                            'exchange': stock['exchange'],
+                            'added_date': datetime.now().isoformat()
+                        }},
+                        upsert=True
+                    )
+                logging.info(f"Added {len(selected)} new stocks to watchlist")
+            else:
+                logging.info("No new stocks to add to watchlist")
+                
+        except Exception as e:
+            logging.error(f"Error getting random stocks: {str(e)}")
+            raise
+
+    def get_stock_info(self, symbol):
+        """Get company overview including sector, industry, and market cap"""
+        try:
+            overview_data = self.api_manager.get_stock_data(
+                symbol=symbol, 
+                function='OVERVIEW'
+            )
+            return overview_data
+        except Exception as e:
+            logging.error(f"Error getting stock info for {symbol}: {str(e)}")
+            raise
+
+    def fetch_stock_data(self, symbol):
+        """Fetch weekly stock data from Alpha Vantage"""
+        try:
+            weekly_data = self.api_manager.get_stock_data(
+                symbol=symbol,
+                function='TIME_SERIES_WEEKLY'
+            )
+            return self.process_time_series(weekly_data['Weekly Time Series'])
+        except Exception as e:
+            logging.error(f"Error fetching stock data for {symbol}: {str(e)}")
+            raise
+
+    def calculate_indicators(self, data):
+        """Calculate technical indicators using weekly data"""
+        try:
+            if not data:
+                logging.warning("No data provided for indicator calculation")
+                return None
+                
+            # Sort data by date
+            dates = sorted(data.keys())
+            if len(dates) < 34:  # Need at least 34 weeks for calculations
+                logging.warning(f"Insufficient data points for indicator calculation. Need 34, got {len(dates)}")
+                return None
+
+            # Get high and low values for AO calculation
+            highs = [float(data[date]['high']) for date in dates]
+            lows = [float(data[date]['low']) for date in dates]
             
-            if processed_count < target_stocks:
-                logging.info(f"Waiting 60 seconds before next attempt...")
-                time.sleep(60)  # Wait longer between attempts
-        
-        logging.info(f"Successfully processed {processed_count} stocks")
-                
-    except Exception as e:
-        logging.error(f"Error updating stock data: {str(e)}")
-    finally:
-        if 'client' in locals():
-            client.close()
+            # Calculate median prices for different periods
+            median_prices = [(high + low) / 2 for high, low in zip(highs, lows)]
+            
+            # Calculate 5-period and 34-period SMAs for AO
+            sma5 = sum(median_prices[-5:]) / 5
+            sma34 = sum(median_prices[-34:]) / 34
+            
+            # Calculate Awesome Oscillator (AO)
+            ao = sma5 - sma34
+            
+            # Calculate Acceleration/Deceleration (AC)
+            # AC = AO - 5-period SMA of AO
+            if len(dates) >= 39:  # Need 5 more periods for AO history
+                prev_aos = []
+                for i in range(5):
+                    idx = -(5+i)
+                    prev_sma5 = sum(median_prices[idx:idx+5]) / 5
+                    prev_sma34 = sum(median_prices[idx-29:idx+5]) / 34
+                    prev_aos.append(prev_sma5 - prev_sma34)
+                ac = ao - (sum(prev_aos) / 5)
+            else:
+                logging.warning(f"Insufficient data points for AC calculation. Need 39, got {len(dates)}")
+                ac = None
 
-def refresh_watchlist():
-    """Refresh the watchlist with new random stocks"""
-    try:
-        db['watchlist'].delete_many({})
-        new_stocks = get_random_stocks()
-        
-        if new_stocks:
-            db['watchlist'].insert_many(new_stocks)
-            logging.info(f"Refreshed watchlist with {len(new_stocks)} new stocks")
-        
-        return new_stocks
-    except Exception as e:
-        logging.error(f"Error refreshing watchlist: {str(e)}")
-        raise
+            return {
+                'ao': ao,
+                'ac': ac,
+                'last_update': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error calculating indicators: {str(e)}")
+            return None
 
-def fetch_stocks():
-    """Fetch stocks from watchlist collection"""
-    try:
-        stocks = refresh_watchlist()
-        return stocks
-    except Exception as e:
-        logging.error(f"Error fetching stocks: {str(e)}")
-        raise
-
-def run_agent():
-    logging.info('Agent started')
-    try:
-        stocks = fetch_stocks()
-        total_stocks = len(stocks)
-        
-        for index, stock in enumerate(stocks):
-            try:
-                logging.info(f"Processing {stock['symbol']} ({index + 1}/{total_stocks})")
+    def update_stock_data(self):
+        """Update stock data in MongoDB"""
+        try:
+            watchlist = list(self.db.watchlist.find())
+            
+            for stock in watchlist:
+                symbol = stock['symbol']
+                logging.info(f"Updating data for {symbol}")
                 
-                # Get stock info including sector and industry
-                info = get_stock_info(stock['symbol'])
-                if info is None:
-                    continue
-                
-                # Fetch stock data
-                data = fetch_stock_data(stock['symbol'])
+                # Get stock info and weekly data
+                info = self.get_stock_info(symbol)
+                weekly_data = self.fetch_stock_data(symbol)
                 
                 # Calculate indicators
-                ao, ac = calculate_ao_ac(data)
+                indicators = self.calculate_indicators(weekly_data)
                 
-                # Prepare document with proper datetime objects
-                stock_doc = {
-                    'symbol': stock['symbol'],
-                    'name': info['name'],
-                    'sector': info['sector'],
-                    'industry': info['industry'],
-                    'market_cap': info['market_cap'],
-                    'last_updated': datetime.now().isoformat(),
-                    'data': data,
-                    'indicators': {
-                        'ao': ao,
-                        'ac': ac,
-                        'entry_condition': ao + ac > 0,
-                        'calculated_at': datetime.now().isoformat()
-                    }
+                # Prepare document
+                doc = {
+                    'symbol': symbol,
+                    'sector': info.get('Sector'),
+                    'industry': info.get('Industry'),
+                    'market_cap': info.get('MarketCapitalization'),
+                    'data': weekly_data,
+                    'indicators': indicators,
+                    'last_update': datetime.now().isoformat()
                 }
                 
-                # Insert new data
-                db['stocks'].insert_one(stock_doc)
-                logging.info(f"Successfully updated {stock['symbol']}")
+                # Update or insert
+                self.db.stocks.update_one(
+                    {'symbol': symbol},
+                    {'$set': doc},
+                    upsert=True
+                )
                 
-                # Status update
-                percent_done = ((index + 1) / total_stocks) * 100
-                logging.info(f'Progress: {percent_done:.2f}% done')
+                time.sleep(12)  # Respect API rate limits
                 
-                # Respect API rate limit
-                if index < total_stocks - 1:
-                    time.sleep(60 / MAX_REQUESTS_PER_MINUTE)
-                
-            except Exception as e:
-                logging.error(f"Error processing {stock['symbol']}: {str(e)}")
-                continue
-                
-    except Exception as e:
-        logging.error(f"Agent error: {str(e)}")
-    finally:
-        logging.info('Agent finished')
+        except Exception as e:
+            logging.error(f"Error in update_stock_data: {str(e)}\n{traceback.format_exc()}")
+            raise
 
-def test_alpha_vantage_connection():
-    """Test connection to Alpha Vantage and log response"""
-    url = f'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=IBM&interval=5min&apikey={API_KEY}'
-    try:
-        response = requests.get(url)
-        logging.info(f"Test request status: {response.status_code}")
-        logging.info(f"Test request content: {response.text[:200]}")  # Log first 200 characters
-    except Exception as e:
-        logging.error(f"Error testing Alpha Vantage connection: {str(e)}")
+    def run(self):
+        """Run the stock agent"""
+        try:
+            # Get initial batch of stocks
+            self.get_random_stocks(is_initial=True)
+            
+            # Main loop
+            while True:
+                try:
+                    # Update stock data
+                    self.update_stock_data()
+                    
+                    # Calculate indicators
+                    self.calculate_indicators(None)
+                    
+                    # Get more stocks if needed
+                    watchlist = list(self.db.watchlist.find())
+                    if len(watchlist) < 35:
+                        self.get_random_stocks(is_initial=False)
+                    
+                    # Sleep for 15 minutes
+                    logging.info("Sleeping for 15 minutes...")
+                    time.sleep(15 * 60)
+                    
+                except Exception as e:
+                    logging.error(f"Error in main loop: {str(e)}")
+                    raise
+                    
+        except Exception as e:
+            logging.error(f"Error in run: {str(e)}")
+            raise
 
-def clear_database():
-    """Clear all collections in the database"""
-    try:
-        client = pymongo.MongoClient(MONGO_URI)
-        db = client['stock_data']
-        db['stocks'].delete_many({})
-        logging.info("Successfully cleared all collections")
-    except Exception as e:
-        logging.error(f"Error clearing database: {str(e)}")
-    finally:
-        if 'client' in locals():
-            client.close()
+    def cleanup(self):
+        """Cleanup resources"""
+        self.api_manager.close()
+        self.db_manager.close()
+
+def main():
+    agent = StockAgent()
+    agent.run()
 
 if __name__ == '__main__':
-    trim_log_file()  # Trim log file before starting
-    run_agent()
+    main()
